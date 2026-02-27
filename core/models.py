@@ -1,146 +1,187 @@
-"""
-Core data models for UPI 2.0 tokenized payment system
-"""
-from pydantic import BaseModel, Field, model_validator
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone
-from decimal import Decimal
-from enum import Enum
-import uuid
+from __future__ import annotations
 
-# ==========================================
-# 1. ENUMS
-# ==========================================
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from typing import Optional, List, Dict, Any
+
+from pydantic import BaseModel, Field, model_validator, field_validator
+
+_DECIMAL_ZERO = Decimal("0.00")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_decimal(value: Decimal) -> Decimal:
+    try:
+        return Decimal(str(value)).quantize(_DECIMAL_ZERO)
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid decimal value")
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError("datetime must be timezone aware")
+    return value.astimezone(timezone.utc)
+
 class Currency(str, Enum):
-    """Supported fiat and digital currencies"""
     INR = "INR"
     USD = "USD"
     EUR = "EUR"
 
+
 class TokenType(str, Enum):
-    """Token lifecycle types"""
     PAYMENT = "PAYMENT"
     REFUND = "REFUND"
     MINT = "MINT"
     BURN = "BURN"
 
+
 class TransactionStatus(str, Enum):
-    """Transaction state machine statuses (Uppercase to match APIs)"""
     PENDING = "PENDING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
 
-# ==========================================
-# 2. CORE DOMAIN MODELS
-# ==========================================
 class UTXO(BaseModel):
-    """Unspent Transaction Output - represents a tokenized amount on the ledger"""
     token_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    # Strict decimal > 0 constraint
-    amount: Decimal = Field(..., gt=Decimal("0.00"))
+    amount: Decimal = Field(..., gt=_DECIMAL_ZERO)
     currency: Currency
     owner_public_key: str
-    
-    # Smart contract conditions (Must be strictly evaluated by a VM, never eval())
-    lock_script: Optional[str] = None 
-    
-    # Timezone-aware datetimes
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    lock_script: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_utc_now)
     expires_at: Optional[datetime] = None
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "token_id": "tok_abc123",
-                "amount": "100.50",
-                "currency": "INR",
-                "owner_public_key": "pub_key_xyz"
-            }
-        }
+
+    @field_validator("amount")
+    @classmethod
+    def normalize_amount(cls, v: Decimal) -> Decimal:
+        return _normalize_decimal(v)
+
+    @field_validator("created_at", "expires_at")
+    @classmethod
+    def enforce_utc(cls, v: Optional[datetime]):
+        if v is None:
+            return v
+        return _ensure_utc(v)
+
+    @model_validator(mode="after")
+    def validate_expiry(self) -> "UTXO":
+        if self.expires_at and self.expires_at <= self.created_at:
+            raise ValueError("expiry must be later than creation time")
+        return self
+
 
 class TransactionInput(BaseModel):
-    """
-    Input to a transaction - references a UTXO.
-    CRITICAL SECURITY FIX: 'amount' has been removed. The core engine MUST look up 
-    the true amount from the ledger using the token_id to prevent spoofing.
-    """
     token_id: str
-    signature: str  # Ed25519 cryptographic signature proving ownership
-    unlock_script: Optional[str] = None  # Satisfies lock_script conditions if present
+    signature: str
+    unlock_script: Optional[str] = None
+
+    @field_validator("token_id")
+    @classmethod
+    def validate_uuid(cls, v: str) -> str:
+        uuid.UUID(v)
+        return v
+
 
 class TransactionOutput(BaseModel):
-    """Output from a transaction - dictates the creation of new UTXOs"""
-    amount: Decimal = Field(..., gt=Decimal("0.00"))
+    amount: Decimal = Field(..., gt=_DECIMAL_ZERO)
     currency: Currency
     owner_public_key: str
     lock_script: Optional[str] = None
 
+    @field_validator("amount")
+    @classmethod
+    def normalize_amount(cls, v: Decimal) -> Decimal:
+        return _normalize_decimal(v)
+
+
 class Transaction(BaseModel):
-    """A structurally validated tokenized transaction"""
     transaction_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    
-    # Must have at least one input and one output
     inputs: List[TransactionInput] = Field(..., min_length=1)
     outputs: List[TransactionOutput] = Field(..., min_length=1)
-    
-    # Fee cannot be negative (prevents infinite money glitch)
-    fee: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
-    
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    fee: Decimal = Field(default=_DECIMAL_ZERO, ge=_DECIMAL_ZERO)
+    timestamp: datetime = Field(default_factory=_utc_now)
+
     status: TransactionStatus = TransactionStatus.PENDING
     metadata: Optional[Dict[str, Any]] = None
 
-    @model_validator(mode='after')
-    def validate_structural_integrity(self) -> 'Transaction':
-        """
-        Validates structural integrity ONLY. 
-        Cryptographic and balance validation MUST happen in the core engine.
-        """
-        # Ensure outputs don't mix currencies (e.g., trying to convert INR to USD without an exchange)
-        if not self.outputs:
-            return self
-            
-        first_currency = self.outputs[0].currency
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, v: datetime):
+        return _ensure_utc(v)
+
+    @field_validator("fee")
+    @classmethod
+    def normalize_fee(cls, v: Decimal):
+        return _normalize_decimal(v)
+
+    @model_validator(mode="after")
+    def validate_currency_consistency(self) -> "Transaction":
+        currency = self.outputs[0].currency
         for out in self.outputs:
-            if out.currency != first_currency:
-                raise ValueError("Transaction outputs cannot contain mixed currencies.")
-                
+            if out.currency != currency:
+                raise ValueError("mixed output currencies are not allowed")
         return self
 
-# ==========================================
-# 3. API REQUEST/RESPONSE MODELS
-# ==========================================
 class PaymentRequest(BaseModel):
-    """Payment request from merchant to wallet"""
     merchant_id: str
-    amount: Decimal = Field(..., gt=Decimal("0.00"))
+    amount: Decimal = Field(..., gt=_DECIMAL_ZERO)
     currency: Currency
     description: Optional[str] = None
     callback_url: Optional[str] = None
     expires_at: Optional[datetime] = None
 
+    @field_validator("amount")
+    @classmethod
+    def normalize_amount(cls, v: Decimal):
+        return _normalize_decimal(v)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expiry(cls, v: Optional[datetime]):
+        if v:
+            v = _ensure_utc(v)
+            if v <= _utc_now():
+                raise ValueError("expiration must be in the future")
+        return v
+
+
 class PaymentResponse(BaseModel):
-    """Payment response from wallet to merchant"""
     transaction_id: str
     status: TransactionStatus
     signed_transaction: Optional[Transaction] = None
     error: Optional[str] = None
 
+
 class MintRequest(BaseModel):
-    """Request to mint new tokens from bank deposits"""
     account_id: str
-    amount: Decimal = Field(..., gt=Decimal("0.00"))
+    amount: Decimal = Field(..., gt=_DECIMAL_ZERO)
     currency: Currency
-    # The destination public key for the minted money
-    public_key: str 
+    public_key: str
     bank_reference: str
     compliance_data: Optional[Dict[str, Any]] = None
 
+    @field_validator("amount")
+    @classmethod
+    def normalize_amount(cls, v: Decimal):
+        return _normalize_decimal(v)
+
+
 class BurnRequest(BaseModel):
-    """Request to burn tokens and return fiat to bank"""
-    # Must provide at least one token to burn
     token_ids: List[str] = Field(..., min_length=1)
     account_id: str
     bank_reference: str
+
+    @field_validator("token_ids")
+    @classmethod
+    def validate_ids(cls, ids: List[str]):
+        for token_id in ids:
+            uuid.UUID(token_id)
+        return ids
