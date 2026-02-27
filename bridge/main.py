@@ -16,7 +16,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 
 
-# ---- monetary precision ----
+
 getcontext().prec = 28
 
 
@@ -108,7 +108,7 @@ app.add_middleware(
 )
 
 
-# ---- request size guard ----
+# ---- request limit guard ----
 
 @app.middleware("http")
 async def body_guard(request: Request, call_next):
