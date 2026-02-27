@@ -24,15 +24,26 @@ from nacl.exceptions import BadSignatureError
 
 DB_PATH = os.getenv("DB_PATH", "ledger.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+NETWORK_ID = os.getenv("NETWORK_ID", "")
 
-_bridge_secret = os.getenv("CLIENT_SECRET_BRIDGE")
-_wallet_secret = os.getenv("CLIENT_SECRET_WALLET")
-_health_token = os.getenv("HEALTH_TOKEN")
+_bridge_secret = os.getenv("CLIENT_SECRET_BRIDGE", "")
+_wallet_secret = os.getenv("CLIENT_SECRET_WALLET", "")
+_health_token = os.getenv("HEALTH_TOKEN", "")
 
-if not _bridge_secret or not _wallet_secret:
-    raise RuntimeError("CLIENT_SECRET_BRIDGE and CLIENT_SECRET_WALLET must be set")
-if not _health_token:
-    raise RuntimeError("HEALTH_TOKEN must be set")
+_MINIMUM_SECRET_BYTES = 32
+
+def _check_secret_entropy(name: str, value: str):
+    if not value:
+        raise RuntimeError(f"{name} must be set")
+    if len(value.encode()) < _MINIMUM_SECRET_BYTES:
+        raise RuntimeError(f"{name} must be at least {_MINIMUM_SECRET_BYTES} bytes")
+
+_check_secret_entropy("CLIENT_SECRET_BRIDGE", _bridge_secret)
+_check_secret_entropy("CLIENT_SECRET_WALLET", _wallet_secret)
+_check_secret_entropy("HEALTH_TOKEN", _health_token)
+
+if not NETWORK_ID:
+    raise RuntimeError("NETWORK_ID must be set")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "https://wallet.hamilton.finance"
@@ -41,8 +52,12 @@ ALLOWED_ORIGINS = os.getenv(
 MAX_BODY = 512_000
 RL_LIMIT_DEFAULT = 120
 RL_LIMIT_TX = 30
-TS_WINDOW = 30
+RL_LIMIT_MINT = 20
+TS_WINDOW_HMAC = 30
+TS_WINDOW_SIG = 60
 MAX_UTXO_LIST = 100
+IDEM_KEY_MAX_LEN = 128
+IDEM_STALE_SECS = TS_WINDOW_SIG * 2 + 10
 ALLOWED_CURRENCIES = frozenset({"USD", "EUR", "GBP", "SGD", "JPY", "CHF"})
 
 SIG_PREFIX_TX = b"HAMILTON_CORE_TX_V1:"
@@ -78,6 +93,22 @@ def get_db():
         conn.close()
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _audit_chain_hash(prev_hash: str, payload: str) -> str:
+    return _sha256_hex((prev_hash + payload).encode())
+
+
+def _gc_stale_idem(conn: sqlite3.Connection):
+    cutoff = int(time.time()) - IDEM_STALE_SECS
+    conn.execute(
+        "DELETE FROM idempotency_cache WHERE status='PENDING' AND created_ts < ?",
+        (cutoff,),
+    )
+
+
 def init_db():
     conn = _get_conn()
     try:
@@ -104,16 +135,18 @@ def init_db():
                 tx_id      TEXT NOT NULL UNIQUE,
                 action     TEXT NOT NULL,
                 payload    TEXT NOT NULL,
+                prev_hash  TEXT NOT NULL DEFAULT '',
+                chain_hash TEXT NOT NULL DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS idempotency_cache (
                 client_id   TEXT NOT NULL,
                 idem_key    TEXT NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'PENDING',
+                status      TEXT NOT NULL DEFAULT 'PENDING',
                 status_code INTEGER,
                 response    TEXT,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_ts  INTEGER NOT NULL,
                 PRIMARY KEY (client_id, idem_key)
             );
         """)
@@ -130,6 +163,9 @@ def init_db():
                 "INSERT OR REPLACE INTO clients (client_id, hmac_key, role) VALUES (?,?,?)",
                 (cid, hk, role),
             )
+
+        _gc_stale_idem(conn)
+        log.info("hamilton_core db initialized network_id=%s", NETWORK_ID)
     finally:
         conn.close()
 
@@ -160,6 +196,15 @@ def _validate_currency(v: str) -> str:
     return normed
 
 
+def _validate_idem_key(v: str):
+    if not v or len(v) > IDEM_KEY_MAX_LEN:
+        raise HTTPException(400, "x-idem must be 1–128 characters")
+    try:
+        uuid.UUID(v)
+    except ValueError:
+        raise HTTPException(400, "x-idem must be a valid UUID")
+
+
 class TxOut(BaseModel):
     token_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     amount: Decimal
@@ -177,17 +222,9 @@ class TxOut(BaseModel):
         return v
 
 
-class TxSigningPayload(BaseModel):
-    transaction_id: str
-    currency: str
-    inputs: list[str]
-    outputs: list[TxOut]
-    signer_public_key: str
-    signed_at: int
-
-
 class TxRequest(BaseModel):
     transaction_id: str
+    network_id: str
     currency: str
     inputs: list[str] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
     outputs: list[TxOut] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
@@ -235,14 +272,9 @@ class MintReq(BaseModel):
         return v
 
 
-class BurnSigningPayload(BaseModel):
-    token_ids: list[str]
-    owner_public_key: str
-    signed_at: int
-
-
 class BurnReq(BaseModel):
     token_ids: list[str] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
+    network_id: str
     owner_public_key: str
     signed_at: int
     signature: str
@@ -271,22 +303,43 @@ def _verify_ed25519(pubkey_hex: str, msg: bytes, sig_hex: str, prefix: bytes):
 
 
 def _verify_signed_at(signed_at: int):
-    age = abs(int(time.time()) - signed_at)
-    if age > TS_WINDOW:
+    if abs(int(time.time()) - signed_at) > TS_WINDOW_SIG:
         raise HTTPException(400, "signed_at out of acceptable window")
+
+
+def _verify_network(provided: str):
+    if provided != NETWORK_ID:
+        raise HTTPException(400, "network_id mismatch")
 
 
 def _canon(data: dict) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
 
+def _audit_insert(conn: sqlite3.Connection, tx_id: str, action: str, payload_str: str):
+    last = conn.execute(
+        "SELECT chain_hash FROM ledger_audit ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+    prev_hash = last["chain_hash"] if last else ""
+    chain_hash = _audit_chain_hash(prev_hash, payload_str)
+    conn.execute(
+        "INSERT INTO ledger_audit (tx_id, action, payload, prev_hash, chain_hash)"
+        " VALUES (?,?,?,?,?)",
+        (tx_id, action, payload_str, prev_hash, chain_hash),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
-    await r.ping()
+    try:
+        await r.ping()
+    except Exception as exc:
+        raise RuntimeError(f"Redis unavailable at startup: {exc}") from exc
     app.state.redis = r
-    log.info("hamilton_core started db=%s redis=%s", DB_PATH, REDIS_URL)
+    log.info("hamilton_core started db=%s redis=%s network=%s", DB_PATH, REDIS_URL, NETWORK_ID)
+    log.info("rate limiting is hard-enforced; Redis unavailability will return 503 by design")
     yield
     await r.close()
 
@@ -328,8 +381,7 @@ async def authenticate(
     except ValueError:
         raise HTTPException(400, "x-timestamp must be an integer unix epoch")
 
-    age = abs(int(time.time()) - ts)
-    if age > TS_WINDOW:
+    if abs(int(time.time()) - ts) > TS_WINDOW_HMAC:
         raise HTTPException(401, "request timestamp out of window")
 
     row = db.execute(
@@ -363,11 +415,10 @@ def require_role(role: str):
     return _check
 
 
-async def rate_limit(request: Request, endpoint_key: str = "default"):
+async def _rate_limit(request: Request, endpoint_key: str, limit: int):
     try:
         r: aioredis.Redis = request.app.state.redis
         cid = getattr(request.state, "client_id", "anon")
-        limit = RL_LIMIT_TX if endpoint_key == "tx" else RL_LIMIT_DEFAULT
         bucket = f"rl:{endpoint_key}:{cid}:{int(time.time()) // 60}"
         count = await r.incr(bucket)
         if count == 1:
@@ -376,49 +427,58 @@ async def rate_limit(request: Request, endpoint_key: str = "default"):
             raise HTTPException(429, "rate limit exceeded")
     except HTTPException:
         raise
-    except Exception:
-        log.warning("redis rate limit unavailable, rejecting request for cid=%s", getattr(request.state, "client_id", "anon"))
-        raise HTTPException(503, "service temporarily unavailable")
+    except Exception as exc:
+        log.warning(
+            "redis unavailable for rate limiting cid=%s reason=%s",
+            getattr(request.state, "client_id", "anon"),
+            type(exc).__name__,
+        )
+        raise HTTPException(503, "service temporarily unavailable: rate limiter offline")
 
 
 async def rate_limit_tx(request: Request):
-    await rate_limit(request, endpoint_key="tx")
+    await _rate_limit(request, "tx", RL_LIMIT_TX)
 
 
 async def rate_limit_default(request: Request):
-    await rate_limit(request, endpoint_key="default")
+    await _rate_limit(request, "default", RL_LIMIT_DEFAULT)
 
 
-def _idem_acquire(db: sqlite3.Connection, client_id: str, key: str) -> Optional[dict]:
-    existing = db.execute(
-        "SELECT status, status_code, response FROM idempotency_cache WHERE client_id=? AND idem_key=?",
+async def rate_limit_mint(request: Request):
+    await _rate_limit(request, "mint", RL_LIMIT_MINT)
+
+
+def _idem_acquire(conn: sqlite3.Connection, client_id: str, key: str) -> Optional[dict]:
+    existing = conn.execute(
+        "SELECT status, status_code, response FROM idempotency_cache"
+        " WHERE client_id=? AND idem_key=?",
         (client_id, key),
     ).fetchone()
 
     if existing:
         if existing["status"] == "COMPLETE":
-            return {"status_code": existing["status_code"], "body": json.loads(existing["response"])}
-        raise HTTPException(409, "concurrent request with same idempotency key")
+            return {
+                "status_code": existing["status_code"],
+                "body": json.loads(existing["response"]),
+            }
+        raise HTTPException(409, "concurrent request with same idempotency key in flight")
 
-    db.execute(
-        "INSERT INTO idempotency_cache (client_id, idem_key, status) VALUES (?,?,?)",
-        (client_id, key, "PENDING"),
+    conn.execute(
+        "INSERT INTO idempotency_cache (client_id, idem_key, status, created_ts)"
+        " VALUES (?,?,?,?)",
+        (client_id, key, "PENDING", int(time.time())),
     )
     return None
 
 
-def _idem_complete(db: sqlite3.Connection, client_id: str, key: str, status: int, body: dict):
-    db.execute(
-        "UPDATE idempotency_cache SET status='COMPLETE', status_code=?, response=? WHERE client_id=? AND idem_key=?",
+def _idem_complete(conn: sqlite3.Connection, client_id: str, key: str, status: int, body: dict):
+    rows = conn.execute(
+        "UPDATE idempotency_cache SET status='COMPLETE', status_code=?, response=?"
+        " WHERE client_id=? AND idem_key=? AND status='PENDING'",
         (status, json.dumps(body), client_id, key),
-    )
-
-
-def _idem_release(db: sqlite3.Connection, client_id: str, key: str):
-    db.execute(
-        "DELETE FROM idempotency_cache WHERE client_id=? AND idem_key=? AND status='PENDING'",
-        (client_id, key),
-    )
+    ).rowcount
+    if rows != 1:
+        raise RuntimeError("idempotency record missing or already completed")
 
 
 _auth_deps = [Depends(authenticate)]
@@ -434,12 +494,20 @@ async def process_tx(
     db: sqlite3.Connection = Depends(get_db),
     x_idem: str = Header(...),
 ):
-    cid = request.state.client_id
-
+    _validate_idem_key(x_idem)
+    _verify_network(tx.network_id)
     _verify_signed_at(tx.signed_at)
+
+    if len(tx.inputs) != len(set(tx.inputs)):
+        raise HTTPException(400, "duplicate inputs")
+
+    output_ids = [o.token_id for o in tx.outputs]
+    if len(output_ids) != len(set(output_ids)):
+        raise HTTPException(400, "duplicate output token_ids")
 
     signing_data = {
         "transaction_id": tx.transaction_id,
+        "network_id": tx.network_id,
         "currency": tx.currency,
         "inputs": tx.inputs,
         "outputs": [
@@ -455,6 +523,8 @@ async def process_tx(
     }
     _verify_ed25519(tx.signer_public_key, _canon(signing_data), tx.signature, SIG_PREFIX_TX)
 
+    cid = request.state.client_id
+
     try:
         db.execute("BEGIN IMMEDIATE")
 
@@ -469,14 +539,12 @@ async def process_tx(
                 "SELECT amount, currency, status, owner_public_key FROM utxos WHERE token_id=?",
                 (tid,),
             ).fetchone()
-
             if not row or row["status"] != "UNSPENT":
                 raise ValueError("UTXO_NOT_AVAILABLE")
             if row["currency"] != tx.currency:
                 raise ValueError("CURRENCY_MISMATCH")
             if row["owner_public_key"] != tx.signer_public_key:
                 raise ValueError("OWNERSHIP_ERROR")
-
             in_total += Decimal(row["amount"])
             db.execute("UPDATE utxos SET status='SPENT' WHERE token_id=?", (tid,))
 
@@ -491,10 +559,7 @@ async def process_tx(
                 (out.token_id, str(out.amount), tx.currency, out.receiver_public_key),
             )
 
-        db.execute(
-            "INSERT INTO ledger_audit (tx_id, action, payload) VALUES (?,?,?)",
-            (tx.transaction_id, "TRANSFER", json.dumps(signing_data)),
-        )
+        _audit_insert(db, tx.transaction_id, "TRANSFER", json.dumps(signing_data))
 
         result = {"status": "COMPLETED", "transaction_id": tx.transaction_id}
         _idem_complete(db, cid, x_idem, 200, result)
@@ -517,7 +582,7 @@ async def process_tx(
 
 @app.post(
     "/tokens/mint",
-    dependencies=_auth_deps + [Depends(rate_limit_default), Depends(require_role("ISSUER"))],
+    dependencies=_auth_deps + [Depends(rate_limit_mint), Depends(require_role("ISSUER"))],
 )
 async def mint(
     request: Request,
@@ -525,6 +590,7 @@ async def mint(
     db: sqlite3.Connection = Depends(get_db),
     x_idem: str = Header(...),
 ):
+    _validate_idem_key(x_idem)
     cid = request.state.client_id
     mint_payload = body.model_dump(mode="json")
 
@@ -543,10 +609,7 @@ async def mint(
             " VALUES (?,?,?,?,'UNSPENT')",
             (tid, str(body.amount), body.currency, body.public_key),
         )
-        db.execute(
-            "INSERT INTO ledger_audit (tx_id, action, payload) VALUES (?,?,?)",
-            (tid, "MINT", json.dumps(mint_payload)),
-        )
+        _audit_insert(db, tid, "MINT", json.dumps(mint_payload))
 
         result = {"status": "COMPLETED", "token_id": tid}
         _idem_complete(db, cid, x_idem, 200, result)
@@ -571,16 +634,22 @@ async def burn(
     db: sqlite3.Connection = Depends(get_db),
     x_idem: str = Header(...),
 ):
-    cid = request.state.client_id
-
+    _validate_idem_key(x_idem)
+    _verify_network(body.network_id)
     _verify_signed_at(body.signed_at)
+
+    if len(body.token_ids) != len(set(body.token_ids)):
+        raise HTTPException(400, "duplicate token_ids in burn request")
 
     signing_data = {
         "token_ids": body.token_ids,
+        "network_id": body.network_id,
         "owner_public_key": body.owner_public_key,
         "signed_at": body.signed_at,
     }
     _verify_ed25519(body.owner_public_key, _canon(signing_data), body.signature, SIG_PREFIX_BURN)
+
+    cid = request.state.client_id
 
     try:
         db.execute("BEGIN IMMEDIATE")
@@ -601,10 +670,7 @@ async def burn(
             db.execute("UPDATE utxos SET status='BURNED' WHERE token_id=?", (tid,))
 
         audit_id = str(uuid.uuid4())
-        db.execute(
-            "INSERT INTO ledger_audit (tx_id, action, payload) VALUES (?,?,?)",
-            (audit_id, "BURN", json.dumps(signing_data)),
-        )
+        _audit_insert(db, audit_id, "BURN", json.dumps(signing_data))
 
         result = {"status": "COMPLETED", "burned": len(body.token_ids)}
         _idem_complete(db, cid, x_idem, 200, result)
