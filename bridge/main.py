@@ -1,8 +1,3 @@
-"""
-Liquidity Bridge — BANK-GRADE SECURE VERSION
-Token Mint/Burn Core Banking Bridge
-"""
-
 import os
 import uuid
 import hmac
@@ -22,15 +17,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from pydantic import BaseModel, Field, validator
 
-# =====================================================
 # MONEY SAFETY
-# =====================================================
 
-getcontext().prec = 28  # banking precision
-
-# =====================================================
+getcontext().prec = 28 
 # CONFIG
-# =====================================================
 
 API_KEY_HASH = os.environ["BRIDGE_API_KEY_HASH"]
 SIGNING_SECRET = os.environ["BRIDGE_SIGNING_SECRET"].encode()
@@ -40,16 +30,12 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://core.local").split(",")
 
 DB_PATH = os.getenv("BRIDGE_DATABASE_URL", "bridge_state.db")
 
-# =====================================================
 # LOGGING
-# =====================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bridge-secure")
 
-# =====================================================
-# FASTAPI INIT
-# =====================================================
+# FASTAPI IS HERE
 
 app = FastAPI(title="Liquidity Bridge Secure", version="2.0")
 
@@ -68,9 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =====================================================
-# BODY SIZE LIMIT
-# =====================================================
+# SIZE LIMITER
 
 @app.middleware("http")
 async def limit_body(request: Request, call_next):
@@ -80,9 +64,7 @@ async def limit_body(request: Request, call_next):
     request._body = body
     return await call_next(request)
 
-# =====================================================
-# DATABASE
-# =====================================================
+# DB
 
 @contextmanager
 def db():
@@ -121,9 +103,6 @@ def init_db():
 
 init_db()
 
-# =====================================================
-# ENUMS
-# =====================================================
 
 class Currency(str, Enum):
     INR = "INR"
@@ -134,9 +113,7 @@ BALANCE_COLUMN = {
     Currency.USD: "usd_balance",
 }
 
-# =====================================================
-# MODELS
-# =====================================================
+# MODELS ?
 
 class MintRequest(BaseModel):
     account_id: str
@@ -157,9 +134,7 @@ class BurnRequest(BaseModel):
             uuid.UUID(t)
         return v
 
-# =====================================================
-# SECURITY
-# =====================================================
+# SECURITY ?
 
 api_key_header = APIKeyHeader(name="X-API-Key")
 
