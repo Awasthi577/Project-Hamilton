@@ -1,114 +1,101 @@
-"""
-Merchant Client — SECURITY HARDENED (Production Grade)
-Patched Version — 2026 Security Audit Fix
-"""
+from __future__ import annotations
 
 import io
+import os
 import json
 import uuid
 import hmac
+import time
 import hashlib
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional, Dict, Any
 
-from fastapi import (
-    FastAPI, HTTPException, Request,
-    Depends, Header, status, Response, Path
-)
-from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-from pydantic import BaseModel, Field
-import redis.asyncio as aioredis
-from redis.asyncio.client import Redis
 import qrcode
+import redis.asyncio as redis
 
-# =====================================================
-# CONFIG
-# =====================================================
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Depends,
+    Header,
+    Response,
+    Path,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field, field_validator
 
 class Settings(BaseModel):
     merchant_id: str
     merchant_name: str
-    merchant_api_key_hash: str
+    api_key_hash: str
     webhook_secret: bytes
-    qr_signing_secret: bytes
+    qr_secret: bytes
     allowed_hosts: list[str]
     allowed_origins: list[str]
+    redis_url: str = "redis://localhost:6379/1"
+
 
 settings = Settings(
-    merchant_id=os.getenv("MERCHANT_ID", "merchant_12345"),
-    merchant_name=os.getenv("MERCHANT_NAME", "Demo Merchant"),
-    merchant_api_key_hash=os.getenv("MERCHANT_API_KEY_HASH"),
-    webhook_secret=os.getenv("WEBHOOK_SECRET").encode(),
-    qr_signing_secret=os.getenv("QR_SIGNING_SECRET").encode(),
+    merchant_id=os.getenv("MERCHANT_ID", "merchant_demo"),
+    merchant_name=os.getenv("MERCHANT_NAME", "Merchant"),
+    api_key_hash=os.environ["MERCHANT_API_KEY_HASH"],
+    webhook_secret=os.environ["WEBHOOK_SECRET"].encode(),
+    qr_secret=os.environ["QR_SIGNING_SECRET"].encode(),
     allowed_hosts=os.getenv("ALLOWED_HOSTS", "localhost").split(","),
     allowed_origins=os.getenv("ALLOWED_ORIGINS", "https://merchant.local").split(","),
 )
 
-# =====================================================
-# LOGGING (SANITIZED)
-# =====================================================
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("merchant-secure")
+log = logging.getLogger("merchant")
 
-# =====================================================
-# FASTAPI INIT
-# =====================================================
-
-app = FastAPI(title="Merchant Secure API", version="2.0")
+app = FastAPI(title="Merchant API")
 
 app.add_middleware(HTTPSRedirectMiddleware)
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=settings.allowed_hosts
+    allowed_hosts=settings.allowed_hosts,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
-
-# =====================================================
-# BODY SIZE LIMIT
-# =====================================================
-
-@app.middleware("http")
-async def limit_body(request: Request, call_next):
-    body = await request.body()
-    if len(body) > 1_000_000:
-        raise HTTPException(413, "Payload too large")
-    request._body = body
-    return await call_next(request)
-
-# =====================================================
-# REDIS
-# =====================================================
 
 @app.on_event("startup")
 async def startup():
-    app.state.redis = aioredis.Redis(host="localhost", port=6379, db=1)
+    app.state.redis = redis.from_url(
+        settings.redis_url,
+        encoding="utf-8",
+        decode_responses=True,
+    )
     await app.state.redis.ping()
+
 
 @app.on_event("shutdown")
 async def shutdown():
     await app.state.redis.close()
 
-# =====================================================
-# MODELS
-# =====================================================
+MAX_BODY = 1_000_000
 
-UUID_REGEX = r"^[0-9a-fA-F-]{36}$"
+
+@app.middleware("http")
+async def body_limit(request: Request, call_next):
+    body = await request.body()
+    if len(body) > MAX_BODY:
+        raise HTTPException(413, "payload too large")
+    request.state.body = body
+    return await call_next(request)
 
 class PaymentCallback(BaseModel):
     payment_request_id: str
@@ -116,83 +103,94 @@ class PaymentCallback(BaseModel):
     status: str
     amount: Decimal
 
-# =====================================================
-# SECURITY HELPERS
-# =====================================================
+    @field_validator("payment_request_id", "transaction_id")
+    @classmethod
+    def validate_uuid(cls, v: str):
+        uuid.UUID(v)
+        return v
+
+def sha256(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
+
 
 api_key_header = APIKeyHeader(name="X-Merchant-Key")
 
-def hash_key(key: str):
-    return hashlib.sha256(key.encode()).hexdigest()
 
-async def verify_admin(key: str = Depends(api_key_header)):
-    if not hmac.compare_digest(
-        hash_key(key),
-        settings.merchant_api_key_hash
-    ):
-        raise HTTPException(401, "Invalid API key")
+async def require_admin(key: str = Depends(api_key_header)):
+    if not hmac.compare_digest(sha256(key), settings.api_key_hash):
+        raise HTTPException(401, "unauthorized")
 
-# -------- Proxy aware IP --------
-def get_ip(request: Request):
-    xfwd = request.headers.get("x-forwarded-for")
-    return xfwd.split(",")[0] if xfwd else request.client.host
+RATE_LIMIT = 10
+WINDOW = 60
 
-# -------- Rate limit --------
-async def rate_limit(request: Request):
-    redis: Redis = request.app.state.redis
-    ip = get_ip(request)
+
+async def enforce_rate_limit(request: Request):
+    r = request.app.state.redis
+    ip = client_ip(request)
 
     key = f"rl:{ip}"
-    count = await redis.incr(key)
+    count = await r.incr(key)
 
     if count == 1:
-        await redis.expire(key, 60)
+        await r.expire(key, WINDOW)
 
-    if count > 10:
-        raise HTTPException(429, "Too many requests")
+    if count > RATE_LIMIT:
+        raise HTTPException(429, "rate limit exceeded")
 
-# =====================================================
-# QR SIGNING
-# =====================================================
+def sign_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    canonical = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
 
-def sign_payload(payload: dict):
-    raw = json.dumps(payload, separators=(",", ":")).encode()
     sig = hmac.new(
-        settings.qr_signing_secret,
-        raw,
-        hashlib.sha256
+        settings.qr_secret,
+        canonical,
+        hashlib.sha256,
     ).hexdigest()
-    payload["sig"] = sig
-    return payload
 
-# =====================================================
-# WEBHOOK VERIFY (ANTI-REPLAY)
-# =====================================================
+    signed = dict(payload)
+    signed["sig"] = sig
+    return signed
+
+MAX_DRIFT = 300
+
 
 async def verify_webhook(
     request: Request,
     x_signature: str = Header(...),
-    x_timestamp: str = Header(...)
+    x_timestamp: str = Header(...),
 ):
-    body = await request.body()
+    body = request.state.body
 
-    ts = datetime.fromtimestamp(int(x_timestamp), tz=timezone.utc)
+    try:
+        ts = int(x_timestamp)
+    except ValueError:
+        raise HTTPException(400, "invalid timestamp")
 
-    if abs((datetime.now(timezone.utc) - ts).total_seconds()) > 300:
-        raise HTTPException(401, "Webhook expired")
+    if abs(time.time() - ts) > MAX_DRIFT:
+        raise HTTPException(401, "expired request")
 
     expected = hmac.new(
         settings.webhook_secret,
         body + x_timestamp.encode(),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
     if not hmac.compare_digest(expected, x_signature):
-        raise HTTPException(403, "Invalid signature")
-
-# =====================================================
-# ATOMIC REDIS UPDATE (Lua)
-# =====================================================
+        raise HTTPException(403, "invalid signature")
 
 UPDATE_SCRIPT = """
 local key = KEYS[1]
@@ -207,87 +205,89 @@ if obj.status ~= "PENDING" then return 2 end
 
 obj.status = status
 obj.transaction_id = tx
+
 redis.call("SET", key, cjson.encode(obj), "EX", 86400)
 return 1
 """
 
-# =====================================================
-# ENDPOINTS
-# =====================================================
-
-@app.post("/payments/create", dependencies=[Depends(verify_admin)])
+@app.post("/payments/create", dependencies=[Depends(require_admin)])
 async def create_payment(request: Request, amount: Decimal):
 
-    redis: Redis = request.app.state.redis
+    await enforce_rate_limit(request)
+
+    r = request.app.state.redis
 
     request_id = str(uuid.uuid4())
-    expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    expiry = utc_now() + timedelta(minutes=5)
 
-    data = {
+    payment = {
         "merchant_id": settings.merchant_id,
         "amount": str(amount),
         "status": "PENDING",
-        "expires_at": expires.isoformat()
+        "expires_at": expiry.isoformat(),
     }
 
-    await redis.set(
+    await r.set(
         f"payment:{request_id}",
-        json.dumps(data),
-        ex=3600
+        json.dumps(payment),
+        ex=3600,
     )
 
-    payload = sign_payload({
-        "intent": "pay",
-        "request_id": request_id,
-        "amount": str(amount),
-        "merchant_id": settings.merchant_id
-    })
+    qr_payload = sign_payload(
+        {
+            "intent": "pay",
+            "request_id": request_id,
+            "amount": str(amount),
+            "merchant_id": settings.merchant_id,
+        }
+    )
 
-    qr = qrcode.make(json.dumps(payload))
+    img = qrcode.make(json.dumps(qr_payload))
     buf = io.BytesIO()
-    qr.save(buf, format="PNG")
+    img.save(buf, format="PNG")
 
     return Response(buf.getvalue(), media_type="image/png")
 
-# -----------------------------------------------------
 
 @app.post("/payments/callback")
-async def callback(
+async def payment_callback(
     request: Request,
     cb: PaymentCallback,
-    _: bool = Depends(verify_webhook)
+    _: None = Depends(verify_webhook),
 ):
-    redis: Redis = request.app.state.redis
+    r = request.app.state.redis
 
-    result = await redis.eval(
+    result = await r.eval(
         UPDATE_SCRIPT,
         1,
         f"payment:{cb.payment_request_id}",
         cb.status,
-        cb.transaction_id
+        cb.transaction_id,
     )
 
     if result == 0:
-        raise HTTPException(404, "Not found")
+        raise HTTPException(404, "payment not found")
 
     return {"status": "accepted"}
 
-# -----------------------------------------------------
 
-@app.get("/payments/{request_id}", dependencies=[Depends(rate_limit)])
-async def status_check(
+@app.get("/payments/{request_id}")
+async def payment_status(
     request: Request,
-    request_id: str = Path(..., pattern=UUID_REGEX)
+    request_id: str = Path(...),
 ):
-    redis: Redis = request.app.state.redis
-    data = await redis.get(f"payment:{request_id}")
+    await enforce_rate_limit(request)
+
+    uuid.UUID(request_id)
+
+    r = request.app.state.redis
+    data = await r.get(f"payment:{request_id}")
 
     if not data:
         raise HTTPException(404)
 
     return json.loads(data)
 
-# -----------------------------------------------------
 
 @app.get("/health")
 async def health():
