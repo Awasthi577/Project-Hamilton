@@ -1,130 +1,137 @@
 import os
 import uuid
 import hmac
+import time
+import sqlite3
 import hashlib
 import logging
-import sqlite3
 from decimal import Decimal, getcontext
 from datetime import datetime, timezone
-from enum import Enum
-from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import List
 
-from fastapi import FastAPI, HTTPException, Request, Depends, Header
-from fastapi.security import APIKeyHeader
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 
-# MONEY SAFETY
 
-getcontext().prec = 28 
-# CONFIG
+# ---- monetary precision ----
+getcontext().prec = 28
+
+
+# ---- configuration ----
 
 API_KEY_HASH = os.environ["BRIDGE_API_KEY_HASH"]
 SIGNING_SECRET = os.environ["BRIDGE_SIGNING_SECRET"].encode()
 
+DB_PATH = os.getenv("BRIDGE_DATABASE_URL", "bridge_state.db")
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost").split(",")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://core.local").split(",")
 
-DB_PATH = os.getenv("BRIDGE_DATABASE_URL", "bridge_state.db")
+MAX_BODY = 1_000_000
+MAX_DRIFT_SECONDS = 300
+RATE_LIMIT = 60
+RATE_WINDOW = 60
 
-# LOGGING
+
+# ---- logging ----
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bridge-secure")
+log = logging.getLogger("bridge")
 
-# FASTAPI IS HERE
 
-app = FastAPI(title="Liquidity Bridge Secure", version="2.0")
+# ---- database ----
 
-app.add_middleware(HTTPSRedirectMiddleware)
+def connect():
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    with connect() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS transactions(
+                transaction_id TEXT PRIMARY KEY,
+                bank_reference TEXT UNIQUE,
+                type TEXT,
+                account_id TEXT,
+                amount TEXT,
+                currency TEXT,
+                status TEXT,
+                created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS liquidity(
+                currency TEXT PRIMARY KEY,
+                total TEXT,
+                available TEXT,
+                locked TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS replay_protection(
+                signature TEXT PRIMARY KEY,
+                created_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS rate_limit(
+                ip TEXT,
+                ts INTEGER
+            );
+            """
+        )
+
+
+init_db()
+
+
+# ---- app ----
+
+app = FastAPI(title="Liquidity Bridge")
+
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=ALLOWED_HOSTS
+    allowed_hosts=ALLOWED_HOSTS,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
-# SIZE LIMITER
+
+# ---- request size guard ----
 
 @app.middleware("http")
-async def limit_body(request: Request, call_next):
+async def body_guard(request: Request, call_next):
     body = await request.body()
-    if len(body) > 1_000_000:
-        raise HTTPException(413, "Payload too large")
-    request._body = body
+    if len(body) > MAX_BODY:
+        raise HTTPException(413, "payload too large")
+    request.state.raw_body = body
     return await call_next(request)
 
-# DB
 
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-def init_db():
-    with db() as conn:
-        c = conn.cursor()
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS transactions(
-            transaction_id TEXT PRIMARY KEY,
-            bank_reference TEXT UNIQUE,
-            type TEXT,
-            account_id TEXT,
-            amount TEXT,
-            currency TEXT,
-            status TEXT,
-            timestamp TEXT
-        )
-        """)
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS liquidity(
-            currency TEXT PRIMARY KEY,
-            total TEXT,
-            available TEXT,
-            locked TEXT
-        )
-        """)
-
-init_db()
-
-
-class Currency(str, Enum):
-    INR = "INR"
-    USD = "USD"
-
-BALANCE_COLUMN = {
-    Currency.INR: "inr_balance",
-    Currency.USD: "usd_balance",
-}
-
-# MODELS ?
+# ---- models ----
 
 class MintRequest(BaseModel):
     account_id: str
     amount: Decimal = Field(..., gt=0)
-    currency: Currency
+    currency: str
     bank_reference: str
+
 
 class BurnRequest(BaseModel):
     account_id: str
     token_ids: List[str]
-    currency: Currency
+    currency: str
     amount: Decimal
     bank_reference: str
 
@@ -134,90 +141,170 @@ class BurnRequest(BaseModel):
             uuid.UUID(t)
         return v
 
-# SECURITY ?
 
-api_key_header = APIKeyHeader(name="X-API-Key")
+# ---- helpers ----
 
-def sha256(x: str):
+def sha256(x: str) -> str:
     return hashlib.sha256(x.encode()).hexdigest()
 
-def verify_api_key(key: str = Depends(api_key_header)):
-    if not hmac.compare_digest(sha256(key), API_KEY_HASH):
-        raise HTTPException(401, "Unauthorized")
 
-# ---------- Signed Request Verification ----------
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---- api key auth ----
+
+api_key = APIKeyHeader(name="X-API-Key")
+
+
+def require_api_key(key: str = Depends(api_key)):
+    if not hmac.compare_digest(sha256(key), API_KEY_HASH):
+        raise HTTPException(401, "unauthorized")
+
+
+# ---- signature verification ----
 
 async def verify_signature(
     request: Request,
     x_signature: str = Header(...),
     x_timestamp: str = Header(...)
 ):
-    body = await request.body()
+    try:
+        ts = int(x_timestamp)
+    except Exception:
+        raise HTTPException(400, "invalid timestamp")
 
-    ts = datetime.fromtimestamp(int(x_timestamp), tz=timezone.utc)
+    if abs(time.time() - ts) > MAX_DRIFT_SECONDS:
+        raise HTTPException(401, "request expired")
 
-    if abs((datetime.now(timezone.utc) - ts).total_seconds()) > 300:
-        raise HTTPException(401, "Expired request")
+    body = request.state.raw_body
+
+    canonical = (
+        request.method.encode()
+        + request.url.path.encode()
+        + body
+        + x_timestamp.encode()
+    )
 
     expected = hmac.new(
         SIGNING_SECRET,
-        body + x_timestamp.encode(),
-        hashlib.sha256
+        canonical,
+        hashlib.sha256,
     ).hexdigest()
 
     if not hmac.compare_digest(expected, x_signature):
-        raise HTTPException(403, "Invalid signature")
+        raise HTTPException(403, "bad signature")
 
-# =====================================================
-# RATE LIMIT
-# =====================================================
+    with connect() as db:
+        try:
+            db.execute(
+                "INSERT INTO replay_protection VALUES (?,?)",
+                (x_signature, ts),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "replay detected")
 
-RATE_BUCKET: Dict[str, int] = {}
 
-def rate_limit(request: Request):
-    ip = request.headers.get("x-forwarded-for", request.client.host)
-    RATE_BUCKET[ip] = RATE_BUCKET.get(ip, 0) + 1
-    if RATE_BUCKET[ip] > 60:
-        raise HTTPException(429, "Too many requests")
+# ---- rate limiting ----
 
-# =====================================================
-# LEDGER INVARIANT
-# =====================================================
+def enforce_rate_limit(request: Request):
+    ip = request.headers.get("x-forwarded-for") or request.client.host
+    cutoff = int(time.time()) - RATE_WINDOW
 
-def verify_liquidity_invariant(conn, currency: Currency):
-    c = conn.cursor()
-    c.execute("SELECT total,available,locked FROM liquidity WHERE currency=?",(currency,))
-    row = c.fetchone()
+    with connect() as db:
+        db.execute("DELETE FROM rate_limit WHERE ts < ?", (cutoff,))
+        db.execute(
+            "INSERT INTO rate_limit VALUES (?,?)",
+            (ip, int(time.time())),
+        )
+
+        count = db.execute(
+            "SELECT COUNT(*) c FROM rate_limit WHERE ip=?",
+            (ip,),
+        ).fetchone()["c"]
+
+    if count > RATE_LIMIT:
+        raise HTTPException(429, "rate limit exceeded")
+
+
+# ---- liquidity invariant ----
+
+def assert_liquidity(db, currency: str):
+    row = db.execute(
+        "SELECT total,available,locked FROM liquidity WHERE currency=?",
+        (currency,),
+    ).fetchone()
+
     if not row:
         return
+
     total = Decimal(row["total"])
-    if total != Decimal(row["available"]) + Decimal(row["locked"]):
-        raise RuntimeError("Liquidity invariant violated")
+    available = Decimal(row["available"])
+    locked = Decimal(row["locked"])
 
-# =====================================================
-# ENDPOINTS
-# =====================================================
+    if total != available + locked:
+        raise RuntimeError("liquidity invariant failure")
 
-@app.post("/mint",
-    dependencies=[Depends(verify_api_key), Depends(verify_signature)]
+
+def adjust_liquidity(db, currency: str, delta: Decimal):
+    row = db.execute(
+        "SELECT * FROM liquidity WHERE currency=?",
+        (currency,),
+    ).fetchone()
+
+    if not row:
+        db.execute(
+            "INSERT INTO liquidity VALUES (?,?,?,?)",
+            (currency, str(delta), str(delta), "0"),
+        )
+        return
+
+    total = Decimal(row["total"]) + delta
+    available = Decimal(row["available"]) + delta
+
+    if available < 0:
+        raise HTTPException(400, "insufficient liquidity")
+
+    db.execute(
+        """
+        UPDATE liquidity
+        SET total=?, available=?
+        WHERE currency=?
+        """,
+        (str(total), str(available), currency),
+    )
+
+
+# ---- endpoints ----
+
+@app.post(
+    "/mint",
+    dependencies=[
+        Depends(require_api_key),
+        Depends(verify_signature),
+    ],
 )
-def mint(req: MintRequest):
+def mint(req: MintRequest, request: Request):
+
+    enforce_rate_limit(request)
 
     tx_id = str(uuid.uuid4())
 
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("BEGIN IMMEDIATE")
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
 
-        # idempotency check
-        c.execute(
+        exists = db.execute(
             "SELECT 1 FROM transactions WHERE bank_reference=?",
-            (req.bank_reference,)
-        )
-        if c.fetchone():
-            raise HTTPException(409, "Duplicate request")
+            (req.bank_reference,),
+        ).fetchone()
 
-        c.execute(
+        if exists:
+            raise HTTPException(409, "duplicate")
+
+        adjust_liquidity(db, req.currency, req.amount)
+        assert_liquidity(db, req.currency)
+
+        db.execute(
             "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
             (
                 tx_id,
@@ -225,41 +312,45 @@ def mint(req: MintRequest):
                 "mint",
                 req.account_id,
                 str(req.amount),
-                req.currency.value,
+                req.currency,
                 "COMPLETED",
-                datetime.now(timezone.utc).isoformat()
-            )
+                now(),
+            ),
         )
 
-        verify_liquidity_invariant(conn, req.currency)
-
-        conn.commit()
+        db.commit()
 
     return {"transaction_id": tx_id, "status": "COMPLETED"}
 
-# -----------------------------------------------------
 
-@app.post("/burn",
-    dependencies=[Depends(verify_api_key), Depends(verify_signature)]
+@app.post(
+    "/burn",
+    dependencies=[
+        Depends(require_api_key),
+        Depends(verify_signature),
+    ],
 )
-def burn(req: BurnRequest):
+def burn(req: BurnRequest, request: Request):
+
+    enforce_rate_limit(request)
 
     tx_id = str(uuid.uuid4())
 
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("BEGIN IMMEDIATE")
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
 
-        c.execute(
+        exists = db.execute(
             "SELECT 1 FROM transactions WHERE bank_reference=?",
-            (req.bank_reference,)
-        )
-        if c.fetchone():
-            raise HTTPException(409, "Duplicate request")
+            (req.bank_reference,),
+        ).fetchone()
 
-        verify_liquidity_invariant(conn, req.currency)
+        if exists:
+            raise HTTPException(409, "duplicate")
 
-        c.execute(
+        adjust_liquidity(db, req.currency, -req.amount)
+        assert_liquidity(db, req.currency)
+
+        db.execute(
             "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",
             (
                 tx_id,
@@ -267,17 +358,16 @@ def burn(req: BurnRequest):
                 "burn",
                 req.account_id,
                 str(req.amount),
-                req.currency.value,
+                req.currency,
                 "COMPLETED",
-                datetime.now(timezone.utc).isoformat()
-            )
+                now(),
+            ),
         )
 
-        conn.commit()
+        db.commit()
 
     return {"transaction_id": tx_id, "status": "COMPLETED"}
 
-# -----------------------------------------------------
 
 @app.get("/health")
 def health():
