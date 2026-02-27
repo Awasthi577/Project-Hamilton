@@ -1,7 +1,4 @@
-"""
-Edge Wallet CLI - Secure, Production-Ready Offline Payment Wallet
-SECURITY HARDENED (Backward Compatible)
-"""
+from __future__ import annotations
 
 import os
 import sys
@@ -13,261 +10,211 @@ import requests
 import gc
 from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import typer
 from rich.console import Console
 from rich.prompt import Prompt
 import qrcode
 
-# Setup path for local imports
+# local imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import Transaction, TransactionInput, TransactionOutput, UTXO
 from core.crypto import CryptoUtils
 
-app = typer.Typer(help="Hamilton Edge Wallet - Secure Offline Transactions")
+
+app = typer.Typer()
 console = Console()
 
 WALLET_DIR = os.path.expanduser("~/.hamilton_wallet")
-KEY_STORAGE = os.path.join(WALLET_DIR, "keys.json")
-UTXO_CACHE = os.path.join(WALLET_DIR, "utxos.json")
+KEY_FILE = os.path.join(WALLET_DIR, "keys.json")
+UTXO_FILE = os.path.join(WALLET_DIR, "utxos.json")
 
-# =====================================================
-# SECURITY HELPERS (ADDED — NON BREAKING)
-# =====================================================
+MAX_RESPONSE_SIZE = 5_000_000
 
-MAX_RESPONSE_SIZE = 5_000_000  # 5MB safety limit
+def ensure_wallet_dir():
+    if not os.path.exists(WALLET_DIR):
+        os.makedirs(WALLET_DIR, mode=0o700)
+    os.chmod(WALLET_DIR, 0o700)
 
 
-def _secure_delete(var):
-    """Best-effort memory cleanup (Python limitation acknowledged)."""
+def _atomic_write(path: str, data: Dict):
+    fd, tmp = tempfile.mkstemp(dir=WALLET_DIR, text=True)
     try:
-        if isinstance(var, bytearray):
-            for i in range(len(var)):
-                var[i] = 0
-    finally:
-        var = None
-        gc.collect()
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        os.remove(tmp)
+        raise
 
 
-def _validate_endpoint(url: str):
-    """Prevent MITM except localhost."""
-    if not url.startswith("https://") and "localhost" not in url:
-        raise ValueError("Only HTTPS endpoints allowed (except localhost).")
-
-
-def _safe_request(method: str, url: str, **kwargs):
-    """Network safety wrapper."""
-    kwargs.setdefault("timeout", 10)
-
-    r = requests.request(method, url, **kwargs)
-
-    if len(r.content) > MAX_RESPONSE_SIZE:
-        raise ValueError("Server response too large")
-
-    return r
-
-
-def _secure_json_load(path: str):
-    """Safe JSON loader with permission audit."""
+def _secure_read(path: str):
     st = os.stat(path)
-    if bool(st.st_mode & (stat.S_IRWXG | stat.S_IRWXO)):
-        console.print("[yellow]Fixing insecure file permissions...[/yellow]")
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         os.chmod(path, 0o600)
 
     with open(path, "r") as f:
         return json.load(f)
 
 
-def _secure_write_json(path: str, data: dict):
-    """Atomic + permission-safe write."""
-    fd, temp_path = tempfile.mkstemp(dir=WALLET_DIR, text=True)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, path)
-    except Exception:
-        os.remove(temp_path)
-        raise
+def _wipe_bytes(buf: bytearray):
+    for i in range(len(buf)):
+        buf[i] = 0
+    gc.collect()
+
+def validate_endpoint(url: str):
+    if not url.startswith("https://") and "localhost" not in url:
+        raise ValueError("endpoint must use HTTPS")
 
 
-# =====================================================
-# WALLET
-# =====================================================
+def safe_request(method: str, url: str, **kwargs):
+    kwargs.setdefault("timeout", 10)
+    r = requests.request(method, url, **kwargs)
 
-class SecureWallet:
+    if len(r.content) > MAX_RESPONSE_SIZE:
+        raise ValueError("response exceeds allowed size")
+
+    return r
+
+class Wallet:
 
     def __init__(self):
-        self._ensure_secure_environment()
-        self.wallet_id = None
+        ensure_wallet_dir()
+        self.wallet_id: Optional[str] = None
         self.public_key = None
 
-    def _ensure_secure_environment(self):
-        if not os.path.exists(WALLET_DIR):
-            os.makedirs(WALLET_DIR, mode=0o700)
+    def exists(self) -> bool:
+        return os.path.exists(KEY_FILE)
 
-        os.chmod(WALLET_DIR, 0o700)
-
-    # -----------------------------
-    # Wallet Creation
-    # -----------------------------
-    def create_wallet(self, password: str):
-
-        console.print("[cyan]Generating cryptographic keys...[/cyan]")
+    def create(self, password: str):
+        console.print("Generating keys...")
 
         pwd = bytearray(password.encode())
 
-        private_key, public_key = CryptoUtils.generate_key_pair()
+        private, public = CryptoUtils.generate_key_pair()
 
         self.wallet_id = str(uuid.uuid4())
-        self.public_key = public_key
+        self.public_key = public
 
-        private_key_str = CryptoUtils.serialize_private_key(
-            private_key, password=password
-        )
-
-        keys_data = {
+        stored = {
             "wallet_id": self.wallet_id,
-            "private_key_encrypted": private_key_str,
-            "public_key": CryptoUtils.serialize_public_key(public_key),
+            "public_key": CryptoUtils.serialize_public_key(public),
+            "private_key": CryptoUtils.serialize_private_key(
+                private,
+                password=password,
+            ),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        _secure_write_json(KEY_STORAGE, keys_data)
+        _atomic_write(KEY_FILE, stored)
 
-        private_key = None
-        _secure_delete(pwd)
+        private = None
+        _wipe_bytes(pwd)
 
-        console.print("[green]Wallet created successfully![/green]")
-        console.print(f"Wallet ID: {self.wallet_id}")
+        console.print(f"Wallet created: {self.wallet_id}")
 
-    # -----------------------------
-    def is_initialized(self) -> bool:
-        return os.path.exists(KEY_STORAGE)
+    def load_public(self):
+        if not self.exists():
+            raise typer.Exit("Wallet not initialized")
 
-    # -----------------------------
-    def load_public_state(self):
-
-        if not self.is_initialized():
-            raise typer.Exit(console.print("[red]Wallet not initialized.[/red]"))
-
-        keys_data = _secure_json_load(KEY_STORAGE)
-
-        self.wallet_id = keys_data["wallet_id"]
+        data = _secure_read(KEY_FILE)
+        self.wallet_id = data["wallet_id"]
         self.public_key = CryptoUtils.deserialize_public_key(
-            keys_data["public_key"]
+            data["public_key"]
         )
 
-    # -----------------------------
-    def _get_decrypted_private_key(self, password: str):
-
+    def _unlock_private(self, password: str):
         pwd = bytearray(password.encode())
-
-        keys_data = _secure_json_load(KEY_STORAGE)
+        data = _secure_read(KEY_FILE)
 
         try:
             key = CryptoUtils.deserialize_private_key(
-                keys_data["private_key_encrypted"],
+                data["private_key"],
                 password=password,
             )
-        except Exception:
-            _secure_delete(pwd)
-            raise ValueError("Incorrect wallet password.")
+        finally:
+            _wipe_bytes(pwd)
 
-        _secure_delete(pwd)
         return key
 
-    # -----------------------------
-    def get_public_key_str(self) -> str:
-        self.load_public_state()
+    def public_key_str(self) -> str:
+        self.load_public()
         return CryptoUtils.serialize_public_key(self.public_key)
 
-    # -----------------------------
-    # Sync UTXOs
-    # -----------------------------
-    def sync_utxos(self, node_url: str, api_key: Optional[str] = None):
+    def sync_utxos(self, node_url: str, api_key: str):
+        validate_endpoint(node_url)
 
-        _validate_endpoint(node_url)
+        pub = self.public_key_str()
 
-        pub_key_str = self.get_public_key_str()
+        console.print(f"Syncing from {node_url}")
 
-        if api_key is None:
-            api_key = os.getenv("HAMILTON_API_KEY")
-            if api_key is None:
-                raise ValueError("API key required")
-
-        console.print(f"[cyan]Syncing UTXOs from {node_url}...[/cyan]")
-
-        response = _safe_request(
+        r = safe_request(
             "GET",
-            f"{node_url}/utxos/{pub_key_str}",
+            f"{node_url}/utxos/{pub}",
             headers={"X-API-Key": api_key},
         )
 
-        if response.status_code != 200:
-            raise ValueError("Failed to sync")
+        if r.status_code != 200:
+            raise ValueError("sync failed")
 
-        _secure_write_json(UTXO_CACHE, response.json())
+        _atomic_write(UTXO_FILE, r.json())
+        console.print("Sync complete")
 
-        console.print("[green]UTXO sync complete.[/green]")
-
-    # -----------------------------
-    def get_local_utxos(self) -> List[UTXO]:
-
-        if not os.path.exists(UTXO_CACHE):
+    def local_utxos(self) -> List[UTXO]:
+        if not os.path.exists(UTXO_FILE):
             return []
 
-        data = _secure_json_load(UTXO_CACHE)
+        data = _secure_read(UTXO_FILE)
         return [UTXO(**u) for u in data]
 
-    # -----------------------------
-    def prepare_unsigned_payment(
-        self, merchant_id: str, amount: Decimal, currency: str = "INR"
+    def build_payment(
+        self,
+        merchant_key: str,
+        amount: Decimal,
+        currency: str = "INR",
     ) -> Transaction:
 
-        if len(merchant_id) < 32:
-            raise ValueError("Invalid merchant public key")
+        self.load_public()
+        my_key = self.public_key_str()
 
-        self.load_public_state()
-        pub_key_str = self.get_public_key_str()
+        utxos = self.local_utxos()
 
-        utxos = self.get_local_utxos()
+        chosen = []
+        total = Decimal("0")
 
-        selected = []
-        total_amount = Decimal("0")
-
-        for utxo in utxos:
-            if utxo.currency == currency:
-                selected.append(utxo)
-                total_amount += Decimal(str(utxo.amount))
-                if total_amount >= amount:
+        for u in utxos:
+            if u.currency == currency:
+                chosen.append(u)
+                total += Decimal(str(u.amount))
+                if total >= amount:
                     break
 
-        if total_amount < amount:
-            raise ValueError("Insufficient funds")
+        if total < amount:
+            raise ValueError("insufficient balance")
 
         inputs = [
             TransactionInput(token_id=u.token_id, signature="")
-            for u in selected
+            for u in chosen
         ]
 
         outputs = [
             TransactionOutput(
                 amount=amount,
                 currency=currency,
-                owner_public_key=merchant_id,
+                owner_public_key=merchant_key,
             )
         ]
 
-        change = total_amount - amount
+        change = total - amount
         if change > 0:
             outputs.append(
                 TransactionOutput(
                     amount=change,
                     currency=currency,
-                    owner_public_key=pub_key_str,
+                    owner_public_key=my_key,
                 )
             )
 
@@ -278,17 +225,17 @@ class SecureWallet:
             fee=Decimal("0"),
         )
 
-    # -----------------------------
-    def sign_transaction(self, tx: Transaction, password: str) -> Transaction:
+    
 
-        private_key = self._get_decrypted_private_key(password)
-        local_utxos = {u.token_id: u for u in self.get_local_utxos()}
+    def sign(self, tx: Transaction, password: str) -> Transaction:
 
-        for idx, input_item in enumerate(tx.inputs):
+        private = self._unlock_private(password)
+        utxo_map = {u.token_id: u for u in self.local_utxos()}
 
-            utxo = local_utxos.get(input_item.token_id)
+        for i, inp in enumerate(tx.inputs):
+            utxo = utxo_map.get(inp.token_id)
             if not utxo:
-                raise ValueError("UTXO missing")
+                raise ValueError("missing utxo")
 
             payload = CryptoUtils.create_token_payload(
                 {
@@ -299,48 +246,54 @@ class SecureWallet:
                 }
             )
 
-            tx.inputs[idx].signature = CryptoUtils.sign_data(
-                private_key, payload
+            tx.inputs[i].signature = CryptoUtils.sign_data(
+                private,
+                payload,
             )
 
-        private_key = None
+        private = None
         gc.collect()
 
         return tx
 
-# =====================================================
-# CLI COMMANDS (UNCHANGED)
-# =====================================================
 
 @app.command()
 def init():
-    wallet = SecureWallet()
+    wallet = Wallet()
 
-    if wallet.is_initialized():
-        console.print("[yellow]Wallet already exists.[/yellow]")
+    if wallet.exists():
+        console.print("Wallet already initialized")
         raise typer.Exit()
 
-    password = Prompt.ask("Enter wallet password", password=True)
-    confirm = Prompt.ask("Confirm password", password=True)
+    pw = Prompt.ask("Password", password=True)
+    confirm = Prompt.ask("Confirm", password=True)
 
-    if password != confirm:
-        console.print("[red]Passwords do not match[/red]")
-        raise typer.Exit(1)
+    if pw != confirm:
+        raise typer.Exit("Passwords do not match")
 
-    wallet.create_wallet(password)
+    wallet.create(pw)
 
 
 @app.command()
 def balance(currency: str = "INR"):
-    wallet = SecureWallet()
-    utxos = wallet.get_local_utxos()
+    wallet = Wallet()
+    utxos = wallet.local_utxos()
 
-    bal = sum(
+    total = sum(
         (Decimal(str(u.amount)) for u in utxos if u.currency == currency),
         Decimal("0"),
     )
 
-    console.print(f"[bold green]{bal} {currency}[/bold green]")
+    console.print(f"{total} {currency}")
+
+
+@app.command()
+def qr(tx_file: str):
+    with open(tx_file, "r") as f:
+        tx = json.load(f)
+
+    img = qrcode.make(json.dumps(tx))
+    img.show()
 
 
 if __name__ == "__main__":
