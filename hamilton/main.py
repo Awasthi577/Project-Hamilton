@@ -27,8 +27,12 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 _bridge_secret = os.getenv("CLIENT_SECRET_BRIDGE")
 _wallet_secret = os.getenv("CLIENT_SECRET_WALLET")
+_health_token = os.getenv("HEALTH_TOKEN")
+
 if not _bridge_secret or not _wallet_secret:
     raise RuntimeError("CLIENT_SECRET_BRIDGE and CLIENT_SECRET_WALLET must be set")
+if not _health_token:
+    raise RuntimeError("HEALTH_TOKEN must be set")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "https://wallet.hamilton.finance"
@@ -43,6 +47,15 @@ ALLOWED_CURRENCIES = frozenset({"USD", "EUR", "GBP", "SGD", "JPY", "CHF"})
 
 SIG_PREFIX_TX = b"HAMILTON_CORE_TX_V1:"
 SIG_PREFIX_BURN = b"HAMILTON_CORE_BURN_V1:"
+
+ALLOWED_HEADERS = [
+    "content-type",
+    "x-client-id",
+    "x-timestamp",
+    "x-signature",
+    "x-idem",
+    "x-health-token",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,20 +78,6 @@ def get_db():
         conn.close()
 
 
-def _get_idem_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def get_idem_db():
-    conn = _get_idem_conn()
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
 def init_db():
     conn = _get_conn()
     try:
@@ -87,7 +86,6 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS clients (
                 client_id   TEXT PRIMARY KEY,
-                secret_hash TEXT NOT NULL,
                 hmac_key    TEXT NOT NULL,
                 role        TEXT NOT NULL
             );
@@ -103,7 +101,7 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS ledger_audit (
                 seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-                tx_id      TEXT NOT NULL,
+                tx_id      TEXT NOT NULL UNIQUE,
                 action     TEXT NOT NULL,
                 payload    TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -112,8 +110,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS idempotency_cache (
                 client_id   TEXT NOT NULL,
                 idem_key    TEXT NOT NULL,
-                status_code INTEGER NOT NULL,
-                response    TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'PENDING',
+                status_code INTEGER,
+                response    TEXT,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (client_id, idem_key)
             );
@@ -123,23 +122,16 @@ def init_db():
             ("liquidity-bridge", _bridge_secret, "ISSUER"),
             ("wallet-service", _wallet_secret, "PROCESSOR"),
         ]:
-            sh = _hash_secret(secret)
-            hk = secrets.token_hex(32)
             existing = conn.execute(
                 "SELECT hmac_key FROM clients WHERE client_id=?", (cid,)
             ).fetchone()
-            if existing:
-                hk = existing["hmac_key"]
+            hk = existing["hmac_key"] if existing else secrets.token_hex(32)
             conn.execute(
-                "INSERT OR REPLACE INTO clients (client_id, secret_hash, hmac_key, role) VALUES (?,?,?,?)",
-                (cid, sh, hk, role),
+                "INSERT OR REPLACE INTO clients (client_id, hmac_key, role) VALUES (?,?,?)",
+                (cid, hk, role),
             )
     finally:
         conn.close()
-
-
-def _hash_secret(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
 
 
 def _to_decimal(v) -> Decimal:
@@ -191,6 +183,7 @@ class TxSigningPayload(BaseModel):
     inputs: list[str]
     outputs: list[TxOut]
     signer_public_key: str
+    signed_at: int
 
 
 class TxRequest(BaseModel):
@@ -199,6 +192,7 @@ class TxRequest(BaseModel):
     inputs: list[str] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
     outputs: list[TxOut] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
     signer_public_key: str
+    signed_at: int
     signature: str
 
     @field_validator("currency", mode="before")
@@ -244,11 +238,13 @@ class MintReq(BaseModel):
 class BurnSigningPayload(BaseModel):
     token_ids: list[str]
     owner_public_key: str
+    signed_at: int
 
 
 class BurnReq(BaseModel):
     token_ids: list[str] = Field(..., min_length=1, max_length=MAX_UTXO_LIST)
     owner_public_key: str
+    signed_at: int
     signature: str
 
     @field_validator("owner_public_key")
@@ -274,6 +270,12 @@ def _verify_ed25519(pubkey_hex: str, msg: bytes, sig_hex: str, prefix: bytes):
         raise HTTPException(400, "signature verification failed")
 
 
+def _verify_signed_at(signed_at: int):
+    age = abs(int(time.time()) - signed_at)
+    if age > TS_WINDOW:
+        raise HTTPException(400, "signed_at out of acceptable window")
+
+
 def _canon(data: dict) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
@@ -295,7 +297,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST", "GET"],
-    allow_headers=["*"],
+    allow_headers=ALLOWED_HEADERS,
 )
 
 
@@ -328,10 +330,10 @@ async def authenticate(
 
     age = abs(int(time.time()) - ts)
     if age > TS_WINDOW:
-        raise HTTPException(401, f"request timestamp out of window")
+        raise HTTPException(401, "request timestamp out of window")
 
     row = db.execute(
-        "SELECT secret_hash, hmac_key, role FROM clients WHERE client_id=?", (x_client_id,)
+        "SELECT hmac_key, role FROM clients WHERE client_id=?", (x_client_id,)
     ).fetchone()
     if not row:
         raise HTTPException(401, "unauthorized")
@@ -344,7 +346,7 @@ async def authenticate(
         + x_timestamp.encode()
     )
     expected = hmac.new(
-        bytes.fromhex(row["hmac_key"]), payload, "sha256"
+        bytes.fromhex(row["hmac_key"]), payload, hashlib.sha256
     ).hexdigest()
 
     if not hmac.compare_digest(expected, x_signature):
@@ -375,7 +377,7 @@ async def rate_limit(request: Request, endpoint_key: str = "default"):
     except HTTPException:
         raise
     except Exception:
-        log.warning("redis rate limit unavailable, failing closed for cid=%s", getattr(request.state, "client_id", "anon"))
+        log.warning("redis rate limit unavailable, rejecting request for cid=%s", getattr(request.state, "client_id", "anon"))
         raise HTTPException(503, "service temporarily unavailable")
 
 
@@ -387,35 +389,54 @@ async def rate_limit_default(request: Request):
     await rate_limit(request, endpoint_key="default")
 
 
-def _idem_get(db: sqlite3.Connection, client_id: str, key: str) -> Optional[dict]:
-    row = db.execute(
-        "SELECT status_code, response FROM idempotency_cache WHERE client_id=? AND idem_key=?",
+def _idem_acquire(db: sqlite3.Connection, client_id: str, key: str) -> Optional[dict]:
+    existing = db.execute(
+        "SELECT status, status_code, response FROM idempotency_cache WHERE client_id=? AND idem_key=?",
         (client_id, key),
     ).fetchone()
-    if row:
-        return {"status_code": row["status_code"], "body": json.loads(row["response"])}
+
+    if existing:
+        if existing["status"] == "COMPLETE":
+            return {"status_code": existing["status_code"], "body": json.loads(existing["response"])}
+        raise HTTPException(409, "concurrent request with same idempotency key")
+
+    db.execute(
+        "INSERT INTO idempotency_cache (client_id, idem_key, status) VALUES (?,?,?)",
+        (client_id, key, "PENDING"),
+    )
     return None
 
 
-def _idem_set(db: sqlite3.Connection, client_id: str, key: str, status: int, body: dict):
+def _idem_complete(db: sqlite3.Connection, client_id: str, key: str, status: int, body: dict):
     db.execute(
-        "INSERT OR IGNORE INTO idempotency_cache (client_id, idem_key, status_code, response) VALUES (?,?,?,?)",
-        (client_id, key, status, json.dumps(body)),
+        "UPDATE idempotency_cache SET status='COMPLETE', status_code=?, response=? WHERE client_id=? AND idem_key=?",
+        (status, json.dumps(body), client_id, key),
+    )
+
+
+def _idem_release(db: sqlite3.Connection, client_id: str, key: str):
+    db.execute(
+        "DELETE FROM idempotency_cache WHERE client_id=? AND idem_key=? AND status='PENDING'",
+        (client_id, key),
     )
 
 
 _auth_deps = [Depends(authenticate)]
 
 
-@app.post("/transactions/process", dependencies=_auth_deps + [Depends(rate_limit_tx)])
+@app.post(
+    "/transactions/process",
+    dependencies=_auth_deps + [Depends(rate_limit_tx), Depends(require_role("PROCESSOR"))],
+)
 async def process_tx(
     request: Request,
     tx: TxRequest,
     db: sqlite3.Connection = Depends(get_db),
-    idem_db: sqlite3.Connection = Depends(get_idem_db),
     x_idem: str = Header(...),
 ):
     cid = request.state.client_id
+
+    _verify_signed_at(tx.signed_at)
 
     signing_data = {
         "transaction_id": tx.transaction_id,
@@ -430,15 +451,17 @@ async def process_tx(
             for o in tx.outputs
         ],
         "signer_public_key": tx.signer_public_key,
+        "signed_at": tx.signed_at,
     }
     _verify_ed25519(tx.signer_public_key, _canon(signing_data), tx.signature, SIG_PREFIX_TX)
 
-    cached = _idem_get(idem_db, cid, x_idem)
-    if cached:
-        return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
     try:
         db.execute("BEGIN IMMEDIATE")
+
+        cached = _idem_acquire(db, cid, x_idem)
+        if cached:
+            db.execute("COMMIT")
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
 
         in_total = Decimal("0.00")
         for tid in tx.inputs:
@@ -473,19 +496,22 @@ async def process_tx(
             (tx.transaction_id, "TRANSFER", json.dumps(signing_data)),
         )
 
+        result = {"status": "COMPLETED", "transaction_id": tx.transaction_id}
+        _idem_complete(db, cid, x_idem, 200, result)
         db.execute("COMMIT")
 
-        result = {"status": "COMPLETED", "transaction_id": tx.transaction_id}
-        _idem_set(idem_db, cid, x_idem, 200, result)
         log.info("tx COMPLETED id=%s inputs=%d outputs=%d", tx.transaction_id, len(tx.inputs), len(tx.outputs))
         return result
 
+    except HTTPException:
+        db.execute("ROLLBACK")
+        raise
     except ValueError as exc:
         db.execute("ROLLBACK")
         raise HTTPException(400, str(exc))
     except Exception:
         db.execute("ROLLBACK")
-        log.exception("unexpected error processing tx %s", tx.transaction_id)
+        log.error("unexpected error processing tx id=%s", tx.transaction_id)
         raise
 
 
@@ -497,20 +523,21 @@ async def mint(
     request: Request,
     body: MintReq,
     db: sqlite3.Connection = Depends(get_db),
-    idem_db: sqlite3.Connection = Depends(get_idem_db),
     x_idem: str = Header(...),
 ):
     cid = request.state.client_id
-
-    cached = _idem_get(idem_db, cid, x_idem)
-    if cached:
-        return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    tid = str(uuid.uuid4())
     mint_payload = body.model_dump(mode="json")
 
     try:
         db.execute("BEGIN IMMEDIATE")
+
+        cached = _idem_acquire(db, cid, x_idem)
+        if cached:
+            db.execute("COMMIT")
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
+
+        tid = str(uuid.uuid4())
+
         db.execute(
             "INSERT INTO utxos (token_id, amount, currency, owner_public_key, status)"
             " VALUES (?,?,?,?,'UNSPENT')",
@@ -520,14 +547,20 @@ async def mint(
             "INSERT INTO ledger_audit (tx_id, action, payload) VALUES (?,?,?)",
             (tid, "MINT", json.dumps(mint_payload)),
         )
-        db.execute("COMMIT")
 
         result = {"status": "COMPLETED", "token_id": tid}
-        _idem_set(idem_db, cid, x_idem, 200, result)
+        _idem_complete(db, cid, x_idem, 200, result)
+        db.execute("COMMIT")
+
         log.info("MINT token=%s amount=%s currency=%s", tid, body.amount, body.currency)
         return result
+
+    except HTTPException:
+        db.execute("ROLLBACK")
+        raise
     except Exception:
         db.execute("ROLLBACK")
+        log.error("unexpected error in mint")
         raise
 
 
@@ -536,23 +569,26 @@ async def burn(
     request: Request,
     body: BurnReq,
     db: sqlite3.Connection = Depends(get_db),
-    idem_db: sqlite3.Connection = Depends(get_idem_db),
     x_idem: str = Header(...),
 ):
     cid = request.state.client_id
 
+    _verify_signed_at(body.signed_at)
+
     signing_data = {
         "token_ids": body.token_ids,
         "owner_public_key": body.owner_public_key,
+        "signed_at": body.signed_at,
     }
     _verify_ed25519(body.owner_public_key, _canon(signing_data), body.signature, SIG_PREFIX_BURN)
 
-    cached = _idem_get(idem_db, cid, x_idem)
-    if cached:
-        return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
     try:
         db.execute("BEGIN IMMEDIATE")
+
+        cached = _idem_acquire(db, cid, x_idem)
+        if cached:
+            db.execute("COMMIT")
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
 
         for tid in body.token_ids:
             row = db.execute(
@@ -570,19 +606,22 @@ async def burn(
             (audit_id, "BURN", json.dumps(signing_data)),
         )
 
+        result = {"status": "COMPLETED", "burned": len(body.token_ids)}
+        _idem_complete(db, cid, x_idem, 200, result)
         db.execute("COMMIT")
 
-        result = {"status": "COMPLETED", "burned": len(body.token_ids)}
-        _idem_set(idem_db, cid, x_idem, 200, result)
         log.info("BURN count=%d owner=%s", len(body.token_ids), body.owner_public_key)
         return result
 
+    except HTTPException:
+        db.execute("ROLLBACK")
+        raise
     except ValueError as exc:
         db.execute("ROLLBACK")
         raise HTTPException(400, str(exc))
     except Exception:
         db.execute("ROLLBACK")
-        log.exception("unexpected error in burn")
+        log.error("unexpected error in burn")
         raise
 
 
@@ -591,8 +630,7 @@ async def health(
     db: sqlite3.Connection = Depends(get_db),
     x_health_token: str = Header(...),
 ):
-    expected = os.getenv("HEALTH_TOKEN", "")
-    if not expected or not secrets.compare_digest(expected, x_health_token):
+    if not secrets.compare_digest(_health_token, x_health_token):
         raise HTTPException(403, "forbidden")
     db.execute("SELECT 1")
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
