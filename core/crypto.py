@@ -1,174 +1,221 @@
-"""
-Cryptographic utilities for UPI 2.0
-Strict, Deterministic, and Type-Safe Implementation
-"""
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Any, Optional, Tuple
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
-from typing import Optional, Dict, Any
-from decimal import Decimal, InvalidOperation
-from datetime import datetime
-import base64
-import json
-import binascii
 
-class CanonicalJSONEncoder(json.JSONEncoder):
-    """
-    Custom JSON Encoder for Cryptographic Canonicalization.
-    Ensures Decimals and Datetimes are serialized consistently across all nodes.
-    """
-    def default(self, obj: Any) -> Any:
-        if isinstance(obj, Decimal):
-            # Quantize to exactly 2 decimal places to prevent float drift and precision manipulation
-            return str(obj.quantize(Decimal('0.00')))
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
+_DECIMAL_QUANT = Decimal("0.00")
 
-class CryptoUtils:
-    """Cryptographic utilities for deterministic token signing and verification"""
-    
-    @staticmethod
-    def generate_key_pair() -> tuple[ed25519.Ed25519PrivateKey, ed25519.Ed25519PublicKey]:
-        """Generate Ed25519 key pair"""
-        private_key = ed25519.Ed25519PrivateKey.generate()
-        public_key = private_key.public_key()
-        return private_key, public_key
-    
-    @staticmethod
-    def serialize_public_key(public_key: ed25519.Ed25519PublicKey) -> str:
-        """Serialize public key to base64 (Raw format for compactness)"""
-        public_bytes = public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-        return base64.b64encode(public_bytes).decode('utf-8')
-    
-    @staticmethod
-    def deserialize_public_key(public_key_str: str) -> ed25519.Ed25519PublicKey:
-        """Deserialize public key from base64"""
-        try:
-            public_bytes = base64.b64decode(public_key_str)
-            return ed25519.Ed25519PublicKey.from_public_bytes(public_bytes)
-        except (binascii.Error, ValueError) as e:
-            raise ValueError(f"Invalid public key format: {e}")
-    
-    @staticmethod
-    def serialize_private_key(private_key: ed25519.Ed25519PrivateKey, password: Optional[str] = None) -> str:
-        """
-        Serialize private key to base64. 
-        Uniformly uses PKCS8 PEM format for both encrypted and unencrypted keys.
-        """
-        # Enforce minimum entropy for wallet password protection
-        if password is not None and len(password) < 8:
-            raise ValueError("Password must be at least 8 characters long to secure the local wallet.")
 
-        encryption_alg = (
-            serialization.BestAvailableEncryption(password.encode('utf-8')) 
-            if password 
-            else serialization.NoEncryption()
-        )
-        
-        pem_bytes = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=encryption_alg
-        )
-        return base64.b64encode(pem_bytes).decode('utf-8')
-    
-    @staticmethod
-    def deserialize_private_key(private_key_str: str, password: Optional[str] = None) -> ed25519.Ed25519PrivateKey:
-        """
-        Deserialize private key from base64.
-        Strictly handles password failures without falling back to raw bytes.
-        """
-        try:
-            pem_bytes = base64.b64decode(private_key_str)
-            return serialization.load_pem_private_key(
-                pem_bytes,
-                password=password.encode('utf-8') if password else None,
-                backend=default_backend()
-            )
-        except ValueError as e:
-            # Handles varying OpenSSL error formats
-            if "Bad decrypt" in str(e) or "bad decrypt" in str(e).lower():
-                raise ValueError("Incorrect wallet password.")
-            raise ValueError(f"Corrupted or invalid private key: {e}")
-        except binascii.Error:
-            raise ValueError("Key is not valid base64.")
-    
-    @staticmethod
-    def sign_data(private_key: ed25519.Ed25519PrivateKey, data: str) -> str:
-        """Sign exact string data with Ed25519 private key"""
-        signature = private_key.sign(data.encode('utf-8'))
-        return base64.b64encode(signature).decode('utf-8')
-    
-    @staticmethod
-    def verify_signature(public_key: ed25519.Ed25519PublicKey, data: str, signature: str) -> bool:
-        """
-        Verify signature securely. 
-        Only catches exact cryptographic failures, allowing systemic errors to surface.
-        """
-        try:
-            sig_bytes = base64.b64decode(signature)
-            public_key.verify(sig_bytes, data.encode('utf-8'))
-            return True
-        except InvalidSignature:
-            return False
-        except (binascii.Error, ValueError):
-            return False # Malformed base64 signature
-    
-    @staticmethod
-    def create_token_payload(token_data: Dict[str, Any]) -> str:
-        """
-        Creates a deterministic, Canonical JSON payload for signing.
-        Fails loudly if required fields are missing instead of generating random data.
-        """
-        required_fields = ["token_id", "amount", "currency", "owner_public_key"]
-        for field in required_fields:
-            if field not in token_data:
-                raise ValueError(f"Cannot sign payload: Missing required field '{field}'")
-                
-        # Precision Locking: Format the amount exactly before hashing to prevent malleability
-        try:
-            strict_amount = str(Decimal(str(token_data["amount"])).quantize(Decimal("0.00")))
-        except InvalidOperation:
-            raise ValueError(f"Invalid currency amount format: {token_data['amount']}")
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-        # Build exact structure to be signed, enforcing strings to prevent JSON object injection
-        payload = {
-            "token_id": str(token_data["token_id"]),
-            "amount": strict_amount,
-            "currency": str(token_data["currency"]),
-            "owner_public_key": str(token_data["owner_public_key"]),
-            "type": "upi_token",
-            "key_id": "v1",  # Key versioning field
-            "version": 1     # Version field for future key rotation
-        }
-        
-        # sort_keys=True is CRITICAL for deterministic cryptographic signatures
-        return json.dumps(
-            payload, 
-            separators=(',', ':'), 
-            sort_keys=True, 
-            cls=CanonicalJSONEncoder
+
+def _b64encode(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64decode(data: str) -> bytes:
+    try:
+        return base64.b64decode(data, validate=True)
+    except binascii.Error:
+        raise ValueError("invalid base64 encoding")
+
+
+def _normalize_amount(value: Any) -> str:
+    try:
+        dec = Decimal(str(value))
+        return str(dec.quantize(_DECIMAL_QUANT))
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid monetary amount")
+
+
+def _canonical_json(obj: Dict[str, Any]) -> str:
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+class KeyPair:
+    __slots__ = ("private", "public")
+
+    def __init__(
+        self,
+        private: Ed25519PrivateKey,
+        public: Ed25519PublicKey,
+    ):
+        self.private = private
+        self.public = public
+
+    @classmethod
+    def generate(cls) -> "KeyPair":
+        private = Ed25519PrivateKey.generate()
+        return cls(private, private.public_key())
+
+
+def serialize_public_key(key: Ed25519PublicKey) -> str:
+    raw = key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return _b64encode(raw)
+
+
+def load_public_key(data: str) -> Ed25519PublicKey:
+    raw = _b64decode(data)
+    if len(raw) != 32:
+        raise ValueError("invalid ed25519 public key length")
+    return Ed25519PublicKey.from_public_bytes(raw)
+
+
+def serialize_private_key(
+    key: Ed25519PrivateKey,
+    password: Optional[str] = None,
+) -> str:
+
+    if password is not None and len(password) < 8:
+        raise ValueError("password too short")
+
+    enc = (
+        serialization.BestAvailableEncryption(password.encode())
+        if password
+        else serialization.NoEncryption()
+    )
+
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=enc,
+    )
+
+    return _b64encode(pem)
+
+
+def load_private_key(
+    data: str,
+    password: Optional[str] = None,
+) -> Ed25519PrivateKey:
+
+    pem = _b64decode(data)
+
+    try:
+        return serialization.load_pem_private_key(
+            pem,
+            password=password.encode() if password else None,
         )
-    
-    @staticmethod
-    def generate_token_signature(private_key: ed25519.Ed25519PrivateKey, payload: str) -> str:
-        """Generate token signature directly from payload string"""
-        return CryptoUtils.sign_data(private_key, payload)
-    
-    @staticmethod
-    def create_signed_token(private_key: ed25519.Ed25519PrivateKey, token_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a complete signed token dictionary"""
-        payload_str = CryptoUtils.create_token_payload(token_data)
-        signature = CryptoUtils.generate_token_signature(private_key, payload_str)
-        
+    except ValueError as exc:
+        msg = str(exc).lower()
+        if "decrypt" in msg:
+            raise ValueError("incorrect password")
+        raise ValueError("invalid private key")
+
+def sign_bytes(key: Ed25519PrivateKey, message: bytes) -> str:
+    sig = key.sign(message)
+    return _b64encode(sig)
+
+
+def verify_bytes(
+    key: Ed25519PublicKey,
+    message: bytes,
+    signature: str,
+) -> bool:
+    try:
+        key.verify(_b64decode(signature), message)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+REQUIRED_FIELDS = (
+    "token_id",
+    "amount",
+    "currency",
+    "owner_public_key",
+)
+
+
+@dataclass(frozen=True)
+class TokenPayload:
+    token_id: str
+    amount: str
+    currency: str
+    owner_public_key: str
+    version: int = 1
+    key_id: str = "v1"
+    type: str = "upi_token"
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "payload": payload_str,
-            "signature": signature,
-            "public_key": CryptoUtils.serialize_public_key(private_key.public_key())
+            "token_id": self.token_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "owner_public_key": self.owner_public_key,
+            "version": self.version,
+            "key_id": self.key_id,
+            "type": self.type,
         }
+
+
+def build_payload(data: Dict[str, Any]) -> str:
+    for field in REQUIRED_FIELDS:
+        if field not in data:
+            raise ValueError(f"missing field: {field}")
+
+    payload = TokenPayload(
+        token_id=str(data["token_id"]),
+        amount=_normalize_amount(data["amount"]),
+        currency=str(data["currency"]),
+        owner_public_key=str(data["owner_public_key"]),
+    )
+
+    return _canonical_json(payload.to_dict())
+
+
+def create_signed_token(
+    private_key: Ed25519PrivateKey,
+    token_data: Dict[str, Any],
+) -> Dict[str, str]:
+
+    payload = build_payload(token_data)
+
+    signature = sign_bytes(
+        private_key,
+        payload.encode("utf-8"),
+    )
+
+    return {
+        "payload": payload,
+        "signature": signature,
+        "public_key": serialize_public_key(
+            private_key.public_key()
+        ),
+        "created_at": _utc_now(),
+    }
+
+
+def verify_signed_token(token: Dict[str, str]) -> bool:
+    try:
+        payload = token["payload"]
+        signature = token["signature"]
+        pub = load_public_key(token["public_key"])
+    except KeyError:
+        return False
+
+    return verify_bytes(
+        pub,
+        payload.encode("utf-8"),
+        signature,
+    )
