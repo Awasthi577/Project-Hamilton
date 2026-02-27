@@ -1,0 +1,9 @@
+fastapi==0.133.1
+uvicorn==0.41.0
+redis==7.2.1
+cryptography==46.0.3
+pydantic==2.12.5
+qrcode==8.2
+python-dotenv==1.0.1
+typer==0.20.0
+requests==2.32.5
